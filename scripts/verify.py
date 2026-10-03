@@ -4,10 +4,17 @@
 
 1. 单元测试（``python -m unittest`` 全量）；
 2. 构建检查（全部源码字节编译 + 关键模块导入）；
-3. HTTP 冒烟（健康检查 + 三个必测场景）：
+3. HTTP 冒烟（健康检查 + 六个必测场景）：
    a. 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
    b. 重叠写入被拒绝（patch_overlap）；
-   c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果。
+   c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果；
+   d. 节数量进入扩展编号范围（>=0xFF00）的高编号 .text 定义符号成功
+      重定位，逐项返回 S/A/P 与写入前后字节、冻结摘要；
+   e. 同一稳定标识提交高编号非代码节定义符号时整体拒绝
+      （symbol_not_in_text），旧成功结论被清除，且无任何部分补丁；
+   f. 异常扩展索引元数据（缺失 / 长度不匹配 / 关联错误 / 重复 / 截断）
+      全部得到可定位拒绝，不产生部分结果；高编号未定义外部符号继续使用
+      用户提交的准确地址。
 
 任何一步失败立即以非零退出码结束；全部成功退出码为 0。
 """
@@ -160,6 +167,47 @@ def pc32_overflow_elf() -> bytes:
     )
 
 
+# 节数量进入扩展编号范围（>=0xFF00）的目标文件：.text=0xFF01，.data=0xFF02
+HIGH_TEXT = b"\x90" * 32
+HIGH_SECTIONS = {0xFF01: (".text", HIGH_TEXT), 0xFF02: (".data", b"ABCD")}
+
+
+def high_text_elf() -> bytes:
+    """高编号 .text 定义符号 + 高编号未定义外部符号。"""
+    return build_elf(
+        text=HIGH_TEXT,
+        high_sections=dict(HIGH_SECTIONS),
+        symbols=[("fn_high", 0xFF01, 0x10), ("ext_foo", 0, 0)],
+        relocs=[
+            {"offset": 0, "sym": 1, "type": 1, "addend": 0x8},
+            {"offset": 8, "sym": 2, "type": 1, "addend": 0},
+        ],
+        xindex={1: 0xFF01},
+    )
+
+
+def high_noncode_elf() -> bytes:
+    """重定位引用的本地符号定义在高编号非代码节 .data。"""
+    return build_elf(
+        text=HIGH_TEXT,
+        high_sections=dict(HIGH_SECTIONS),
+        symbols=[("d_in_data", 0xFF02, 2)],
+        relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+        xindex={1: 0xFF02},
+    )
+
+
+def bad_xindex_elf(xindex_values=None, **kw) -> bytes:
+    return build_elf(
+        text=HIGH_TEXT,
+        high_sections=dict(HIGH_SECTIONS),
+        symbols=[("fn_high", 0xFF01, 0x10)],
+        relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+        xindex={1: 0xFF01} if xindex_values is None else xindex_values,
+        **kw,
+    )
+
+
 def check_http_smoke() -> None:
     step("3/3 HTTP 冒烟")
     wait_for_health()
@@ -249,6 +297,98 @@ def check_http_smoke() -> None:
     if status != 200 or stored.get("ok"):
         fail("溢出记录不应包含成功结论/部分补丁")
     print("verify: PC32 有符号 32 位溢出已拒绝，未生成部分结果")
+
+    # 场景 d：高编号 .text 定义符号成功重定位（外部符号使用精确地址）
+    payload_d = {
+        "audit_id": "verify-high-text",
+        "file_base64": b64(high_text_elf()),
+        "load_base": 0x400000,
+        "symbols": {"ext_foo": 0x500000},
+    }
+    status, body_d = http_post("/api/audit", payload_d)
+    if status != 200 or not body_d.get("ok"):
+        fail(f"高编号 .text 符号重定位应成功：HTTP {status} {body_d}")
+    items_d = body_d.get("items", [])
+    if len(items_d) != 2:
+        fail(f"高编号文件应返回 2 个重定位项，实际 {len(items_d)}")
+    by_sym = {it["symbol"]: it for it in items_d}
+    fn_item = by_sym["fn_high"]
+    if fn_item["S"] != f"0x{0x400010:016x}":
+        fail(f"高编号 .text 符号 S 计算错误：{fn_item['S']}")
+    if fn_item["A"] != "8" or fn_item["P"] != f"0x{0x400000:016x}":
+        fail(f"高编号 .text 符号 A/P 错误：A={fn_item['A']} P={fn_item['P']}")
+    if fn_item["after_hex"] != struct.pack("<Q", 0x400018).hex():
+        fail(f"高编号 .text 符号写入值错误：{fn_item['after_hex']}")
+    if fn_item["before_hex"] != (b"\x90" * 8).hex():
+        fail("高编号 .text 符号写入前字节错误")
+    ext_item = by_sym["ext_foo"]
+    if ext_item["S"] != f"0x{0x500000:016x}" or ext_item["after_hex"] != struct.pack("<Q", 0x500000).hex():
+        fail("高编号未定义外部符号未使用用户提交的准确地址")
+    if len(body_d.get("conclusion", "")) != 64:
+        fail("高编号成功结果缺少 64 字符冻结结论")
+    if len(body_d.get("text_sha256_before", "")) != 64 or len(body_d.get("patched_sha256", "")) != 64:
+        fail("高编号成功结果缺少补丁前后 .text 摘要")
+    status, fetched_d = http_get("/api/result/verify-high-text")
+    if status != 200 or fetched_d.get("conclusion") != body_d["conclusion"]:
+        fail("高编号冻结结论无法按标识读回")
+    print(f"verify: 高编号 .text 符号重定位成功，结论 {body_d['conclusion']}")
+
+    # 场景 e：同一稳定标识提交高编号非代码节定义符号 -> 整体拒绝并清除旧成功
+    payload_e = {
+        "audit_id": "verify-high-text",  # 复用：旧 PASS 必须被清除
+        "file_base64": b64(high_noncode_elf()),
+        "load_base": 0x400000,
+        "symbols": {},
+    }
+    status, body_e = http_post("/api/audit", payload_e)
+    if status != 200 or body_e.get("ok"):
+        fail(f"高编号非代码节符号应被拒绝：HTTP {status} {body_e}")
+    ve = body_e.get("violation", {})
+    if ve.get("code") != "symbol_not_in_text":
+        fail(f"违约代码应为 symbol_not_in_text：{ve}")
+    if ve.get("entry_index") != 0 or ve.get("symbol") != "d_in_data":
+        fail(f"未稳定定位到违规符号：{ve}")
+    if ve.get("detail", {}).get("shndx") != 0xFF02:
+        fail(f"违约定位未给出高编号非代码节索引：{ve}")
+    for leaked in ("conclusion", "patches", "items", "patched_text_hex"):
+        if leaked in body_e:
+            fail(f"拒绝响应泄露部分结果字段：{leaked}")
+    status, again_e = http_get("/api/result/verify-high-text")
+    if status != 200 or again_e.get("ok") or "conclusion" in again_e:
+        fail("高编号拒绝后旧成功结论未被清除或仍可读出部分结果")
+    print("verify: 高编号非代码节符号已稳定拒绝（shndx=0xff02），旧成功结论已清除，无部分补丁")
+
+    # 场景 f：异常扩展索引元数据 -> 可定位拒绝，且不产生部分结果
+    bad_cases = [
+        ("缺失扩展索引节", bad_xindex_elf(xindex_emit=False), "missing_xindex_section"),
+        ("扩展索引长度不足", bad_xindex_elf(xindex_count_delta=-1), "bad_xindex_length"),
+        ("扩展索引长度过长", bad_xindex_elf(xindex_count_delta=2), "bad_xindex_length"),
+        ("扩展索引长度非 4 倍数", bad_xindex_elf(xindex_bad_size=True), "bad_xindex_size"),
+        ("扩展索引关联错误", bad_xindex_elf(xindex_link_override=1), "bad_xindex_link"),
+        ("扩展索引节重复", bad_xindex_elf(xindex_duplicate=True), "xindex_not_unique"),
+        ("扩展索引值仍为 0xffff", bad_xindex_elf(xindex_values={1: 0xFFFF}),
+         "bad_extended_symbol_index"),
+    ]
+    for label, elf_bytes, expect_code in bad_cases:
+        payload_f = {
+            "audit_id": "verify-bad-xindex",
+            "file_base64": b64(elf_bytes),
+            "load_base": 0x400000,
+            "symbols": {},
+        }
+        status, body_f = http_post("/api/audit", payload_f)
+        if status != 200 or body_f.get("ok"):
+            fail(f"{label}：应被拒绝：HTTP {status} {body_f}")
+        vf = body_f.get("violation", {})
+        if vf.get("code") != expect_code:
+            fail(f"{label}：违约代码应为 {expect_code}，实际 {vf.get('code')}")
+        for leaked in ("conclusion", "patches", "items", "patched_text_hex"):
+            if leaked in body_f:
+                fail(f"{label}：拒绝响应泄露部分结果字段 {leaked}")
+    status, stored_f = http_get("/api/result/verify-bad-xindex")
+    if status != 200 or stored_f.get("ok") or "conclusion" in stored_f:
+        fail("异常索引元数据的拒绝记录不得包含成功结论/部分补丁")
+    print(f"verify: {len(bad_cases)} 类异常扩展索引元数据全部可定位拒绝，无部分结果")
 
 
 def main() -> None:

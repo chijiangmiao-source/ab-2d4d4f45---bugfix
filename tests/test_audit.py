@@ -28,7 +28,6 @@ from elfbuild import (  # noqa: E402
     SHT_REL,
     build_elf,
 )
-
 BASE = 0x400000
 # PC32 的外部符号必须在 P 的有符号 32 位范围内；ext_foo 用于 R64 可任意。
 SYMS = {"ext_foo": 0x500000, "memcpy": 0x400200}
@@ -507,6 +506,260 @@ class ByteTamperTests(unittest.TestCase):
         self.assertEqual(v.entry_index, 0)
 
 
+class ExtendedSectionIndexTests(unittest.TestCase):
+    """节数量进入扩展编号范围（>=0xFF00）与 SHT_SYMTAB_SHNDX 扩展索引。"""
+
+    TEXT = b"\x90" * 32
+    DATA = b"ABCD"
+    HIGH = {0xFF01: (".text", TEXT), 0xFF02: (".data", DATA)}
+
+    def _high(self, *, symbols, relocs, **kw):
+        return build_elf(
+            text=self.TEXT,
+            high_sections=dict(self.HIGH),
+            symbols=symbols,
+            relocs=relocs,
+            **kw,
+        )
+
+    def assertReject(self, result, code):
+        self.assertFalse(result.ok)
+        self.assertEqual(result.violation.code, code)
+        # 任何拒绝都不得携带部分补丁
+        self.assertEqual(result.items, [])
+        self.assertEqual(result.patched, b"")
+        self.assertEqual(result.patched_sha256, "")
+        return result.violation
+
+    def test_high_noncode_symbol_rejected_with_location(self):
+        elf = self._high(
+            symbols=[("d_in_data", 0xFF02, 2)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0xFF02},
+        )
+        v = self.assertReject(elfaudit.audit(elf, BASE, {}), "symbol_not_in_text")
+        self.assertEqual(v.entry_index, 0)
+        self.assertEqual(v.rela_section, ".rela.text")
+        self.assertEqual(v.rela_index, 0)
+        self.assertEqual(v.symbol, "d_in_data")
+        self.assertEqual(v.detail["shndx"], 0xFF02)
+        self.assertEqual(v.detail["section"], ".data")
+        self.assertTrue(v.detail["via_extended_index"])
+
+    def test_high_text_symbol_success_r64(self):
+        elf = self._high(
+            symbols=[("fn_high", 0xFF01, 0x10)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0x8}],
+            xindex={1: 0xFF01},
+        )
+        r = elfaudit.audit(elf, BASE, {})
+        self.assertTrue(r.ok, r.violation)
+        it = r.items[0]
+        self.assertEqual(it.s, BASE + 0x10)          # S = 基址 + st_value
+        self.assertEqual(it.a, 0x8)                  # A
+        self.assertEqual(it.p, BASE + 0)             # P = 基址 + 节内偏移
+        self.assertEqual(it.value, BASE + 0x18)
+        self.assertEqual(it.before, b"\x90" * 8)     # 写入前字节
+        self.assertEqual(it.after, struct.pack("<Q", BASE + 0x18))  # 写入后字节
+        self.assertEqual(r.patched[:8], struct.pack("<Q", BASE + 0x18))
+        import hashlib
+
+        self.assertEqual(r.patched_sha256, hashlib.sha256(r.patched).hexdigest())
+        c1 = elfaudit.freeze_conclusion("high-id", r, {})
+        c2 = elfaudit.freeze_conclusion("high-id", elfaudit.audit(elf, BASE, {}), {})
+        self.assertEqual(c1, c2)
+        self.assertEqual(len(c1), 64)
+
+    def test_high_text_symbol_success_pc32(self):
+        elf = self._high(
+            symbols=[("fn_high", 0xFF01, 0x10)],
+            relocs=[{"offset": 4, "sym": 1, "type": 2, "addend": -4}],
+            xindex={1: 0xFF01},
+        )
+        r = elfaudit.audit(elf, BASE, {})
+        self.assertTrue(r.ok, r.violation)
+        it = r.items[0]
+        self.assertEqual(it.s, BASE + 0x10)
+        self.assertEqual(it.p, BASE + 4)
+        self.assertEqual(it.value, BASE + 0x10 - 4 - (BASE + 4))
+        self.assertEqual(it.after, struct.pack("<i", it.value))
+
+    def test_high_undefined_external_uses_supplied_address(self):
+        elf = self._high(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0x10}],
+        )
+        exact = 0xABCDEF0123
+        r = elfaudit.audit(elf, BASE, {"ext_foo": exact})
+        self.assertTrue(r.ok, r.violation)
+        self.assertEqual(r.items[0].s, exact)
+        self.assertEqual(r.items[0].value, (exact + 0x10) & ((1 << 64) - 1))
+
+    def test_high_text_and_external_together(self):
+        elf = self._high(
+            symbols=[("fn_high", 0xFF01, 0x10), ("memcpy", 0, 0)],
+            relocs=[
+                {"offset": 0, "sym": 1, "type": 1, "addend": 0},
+                {"offset": 8, "sym": 2, "type": 2, "addend": 0},
+            ],
+            xindex={1: 0xFF01},
+        )
+        r = elfaudit.audit(elf, BASE, {"memcpy": 0x400200})
+        self.assertTrue(r.ok, r.violation)
+        self.assertEqual([i.value for i in r.items], [BASE + 0x10, 0x400200 - (BASE + 8)])
+
+    def test_missing_xindex_section_rejected(self):
+        elf = self._high(
+            symbols=[("d_in_data", 0xFF02, 0)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0xFF02},
+            xindex_emit=False,
+        )
+        v = self.assertReject(elfaudit.audit(elf, BASE, {}), "missing_xindex_section")
+        self.assertEqual(v.entry_index, 0)
+
+    def test_xindex_length_mismatch_rejected(self):
+        for delta in (-1, 1, -2):
+            elf = self._high(
+                symbols=[("fn_high", 0xFF01, 0x10)],
+                relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+                xindex={1: 0xFF01},
+                xindex_count_delta=delta,
+            )
+            self.assertReject(elfaudit.audit(elf, BASE, {}), "bad_xindex_length")
+
+    def test_xindex_bad_size_rejected(self):
+        elf = self._high(
+            symbols=[("fn_high", 0xFF01, 0x10)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0xFF01},
+            xindex_bad_size=True,
+        )
+        self.assertReject(elfaudit.audit(elf, BASE, {}), "bad_xindex_size")
+
+    def test_xindex_bad_link_rejected(self):
+        elf = self._high(
+            symbols=[("fn_high", 0xFF01, 0x10)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0xFF01},
+            xindex_link_override=1,  # 指向 .text 而非符号表
+        )
+        self.assertReject(elfaudit.audit(elf, BASE, {}), "bad_xindex_link")
+
+    def test_xindex_duplicate_rejected(self):
+        elf = self._high(
+            symbols=[("fn_high", 0xFF01, 0x10)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0xFF01},
+            xindex_duplicate=True,
+        )
+        self.assertReject(elfaudit.audit(elf, BASE, {}), "xindex_not_unique")
+
+    def test_xindex_value_xffff_rejected(self):
+        elf = self._high(
+            symbols=[("fn_high", 0xFF01, 0x10)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0xFFFF},
+        )
+        v = self.assertReject(elfaudit.audit(elf, BASE, {}), "bad_extended_symbol_index")
+        self.assertEqual(v.entry_index, 0)
+
+    def test_xindex_reserved_pseudo_index_rejected(self):
+        elf = self._high(
+            symbols=[("abs_sym", 0xFF01, 0x1234)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0xFFF1},  # SHN_ABS
+        )
+        v = self.assertReject(elfaudit.audit(elf, BASE, {}), "unsupported_symbol_section")
+        self.assertEqual(v.entry_index, 0)
+
+    def test_xindex_section_number_out_of_range(self):
+        # 普通（低节数）文件，扩展索引给出一个小于 0xFF00 但越过节表的编号
+        elf = build_elf(
+            text=b"\x00" * 32,
+            symbols=[("ghost", "text", 0)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0x5000},
+        )
+        v = self.assertReject(elfaudit.audit(elf, BASE, {}), "symbol_section_out_of_range")
+        self.assertEqual(v.detail["shndx"], 0x5000)
+        self.assertTrue(v.detail["via_extended_index"])
+
+    def test_low_file_extended_index_to_real_section(self):
+        # 普通节数的文件同样可携带 SHT_SYMTAB_SHNDX：指向 .rodata 仍须拒绝，
+        # 指向 .text 必须成功。
+        elf = build_elf(
+            text=b"\x00" * 32,
+            rodata=b"abc",
+            symbols=[("d", "rodata", 0)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 2},
+        )
+        v = self.assertReject(elfaudit.audit(elf, BASE, {}), "symbol_not_in_text")
+        self.assertEqual(v.detail["shndx"], 2)
+        self.assertTrue(v.detail["via_extended_index"])
+
+        elf_ok = build_elf(
+            text=b"\x00" * 32,
+            symbols=[("fn", "text", 0x8)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 1},
+        )
+        r = elfaudit.audit(elf_ok, BASE, {})
+        self.assertTrue(r.ok, r.violation)
+        self.assertEqual(r.items[0].s, BASE + 0x8)
+
+    def _find_shdr(self, data: bytes, sh_type: int) -> int:
+        shoff = struct.unpack_from("<Q", data, 0x28)[0]
+        shnum = struct.unpack_from("<H", data, 0x3C)[0]
+        if shnum == 0:
+            shnum = struct.unpack_from("<Q", data, shoff + 32)[0]
+        for i in range(1, shnum):
+            off = shoff + i * 64
+            if struct.unpack_from("<I", data, off + 4)[0] == sh_type:
+                return off
+        self.fail(f"未找到类型 {sh_type} 的节头")
+
+    def test_xindex_section_oversize_rejected(self):
+        elf = build_elf(
+            text=b"\x00" * 32,
+            symbols=[("fn", "text", 0x8)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 1},
+        )
+        xi = self._find_shdr(elf, 18)
+        bad = bytearray(elf)
+        struct.pack_into("<Q", bad, xi + 32, 0x100000)  # sh_size 巨大 -> 越界
+        self.assertReject(elfaudit.audit(bytes(bad), BASE, {}), "section_out_of_bounds")
+
+    def test_xindex_section_body_truncated_rejected(self):
+        elf = build_elf(
+            text=b"\x00" * 32,
+            symbols=[("fn", "text", 0x8)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 1},
+        )
+        xi = self._find_shdr(elf, 18)
+        bad = bytearray(elf)
+        # sh_offset 贴近文件末尾，声称的节体超出 EOF（截断）
+        struct.pack_into("<Q", bad, xi + 24, len(elf) - 2)
+        self.assertReject(elfaudit.audit(bytes(bad), BASE, {}), "section_out_of_bounds")
+
+    def test_high_file_first_violation_still_located(self):
+        # 高编号文件中第一项即违约时，定位不得被后续项干扰
+        elf = self._high(
+            symbols=[("d_in_data", 0xFF02, 0), ("ext_foo", 0, 0)],
+            relocs=[
+                {"offset": 0, "sym": 1, "type": 1, "addend": 0},
+                {"offset": 8, "sym": 2, "type": 1, "addend": 0},
+            ],
+            xindex={1: 0xFF02},
+        )
+        v = self.assertReject(elfaudit.audit(elf, BASE, {"ext_foo": 1}), "symbol_not_in_text")
+        self.assertEqual(v.entry_index, 0)
+        self.assertEqual(v.symbol, "d_in_data")
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         # 每个用例使用独立存储：直接操作模块全局字典
@@ -548,6 +801,47 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(stored["kind"], "fail")
         self.assertNotIn("result", stored)
         again = run_audit  # noqa: F841 (仅确认 API 可重入)
+
+    def test_high_noncode_clears_previous_high_text_success(self):
+        from app import server
+
+        text = b"\x90" * 32
+        high = {0xFF01: (".text", text), 0xFF02: (".data", b"ABCD")}
+        # 1) 高编号 .text 定义符号先成功并冻结
+        good = build_elf(
+            text=text,
+            high_sections=dict(high),
+            symbols=[("fn_high", 0xFF01, 0x10)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0x8}],
+            xindex={1: 0xFF01},
+        )
+        ok = run_audit(make_payload(good, "vendor-extended", symbols={}))
+        self.assertTrue(ok["ok"])
+        self.assertEqual(len(ok["conclusion"]), 64)
+        self.assertEqual(ok["items"][0]["S"], f"0x{BASE + 0x10:016x}")
+
+        # 2) 同一标识提交高编号非代码节定义符号：整体拒绝
+        bad = build_elf(
+            text=text,
+            high_sections=dict(high),
+            symbols=[("d_in_data", 0xFF02, 2)],
+            relocs=[{"offset": 0, "sym": 1, "type": 1, "addend": 0}],
+            xindex={1: 0xFF02},
+        )
+        fail = run_audit(make_payload(bad, "vendor-extended", symbols={}))
+        self.assertFalse(fail["ok"])
+        self.assertEqual(fail["violation"]["code"], "symbol_not_in_text")
+        self.assertEqual(fail["violation"]["entry_index"], 0)
+        self.assertEqual(fail["violation"]["symbol"], "d_in_data")
+        self.assertEqual(fail["violation"]["detail"]["shndx"], 0xFF02)
+        for leaked in ("conclusion", "patches", "items", "patched_text_hex"):
+            self.assertNotIn(leaked, fail)
+
+        # 3) 旧成功结论已被清除，只剩可定位的违约记录
+        stored = server._store["vendor-extended"]
+        self.assertEqual(stored["kind"], "fail")
+        self.assertNotIn("result", stored)
+        self.assertNotIn("conclusion", stored)
 
     def test_pc32_overflow_rejected_via_api(self):
         bad = build_elf(
