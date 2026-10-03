@@ -4,6 +4,9 @@
 
 * ELF64 / 小端 / ``ET_REL`` / ``EM_X86_64``；
 * 节表中存在唯一名为 ``.text`` 的节；
+* 支持扩展节编号：节数 >= ``SHN_LORESERVE`` 时经第 0 节头 ``sh_size`` 取得
+  真实节数、``sh_link`` 取得真实节名字符串表索引（``e_shstrndx=SHN_XINDEX``）；
+  ``st_shndx=SHN_XINDEX`` 的符号由关联的 ``SHT_SYMTAB_SHNDX`` 节取得真实节编号；
 * 所有 ``SHT_RELA`` 节都必须指向该 ``.text``，不接受 ``SHT_REL``；
 * 仅处理 ``R_X86_64_64``（8 字节绝对写）与 ``R_X86_64_PC32``
   （4 字节有符号 PC 相对写）。
@@ -49,6 +52,9 @@ SHT_SYMTAB_SHNDX = 18
 
 SHN_UNDEF = 0
 SHN_LORESERVE = 0xFF00
+SHN_ABS = 0xFFF1
+SHN_COMMON = 0xFFF2
+SHN_HIRESERVE = 0xFFFF
 SHN_XINDEX = 0xFFFF
 
 R_X86_64_64 = 1
@@ -322,10 +328,13 @@ def _audit(data: bytes, load_base: int, symbols: dict[str, int]) -> AuditResult:
             raise AuditViolation("section", "no_section_table", "扩展节表计数为零")
     if e_shentsize != SHDR_SIZE:
         raise AuditViolation("section", "bad_shentsize", f"e_shentsize 必须为 64，实际 {e_shentsize}")
-    if e_shstrndx >= e_shnum:
-        raise AuditViolation("section", "bad_shstrndx", "e_shstrndx 超出节表范围")
     if e_shoff + e_shnum * SHDR_SIZE > len(data):
         raise AuditViolation("section", "section_table_truncated", "节表超出文件边界")
+    # e_shstrndx==SHN_XINDEX 时真实索引存放在第 0 节头的 sh_link，须等节表
+    # 解析后才能取得；此处先保留原始值。
+    raw_shstrndx = e_shstrndx
+    if raw_shstrndx != SHN_XINDEX and raw_shstrndx >= e_shnum:
+        raise AuditViolation("section", "bad_shstrndx", "e_shstrndx 超出节表范围")
 
     # --- 节表 -------------------------------------------------------------
     sections: list[dict[str, Any]] = []
@@ -367,6 +376,16 @@ def _audit(data: bytes, load_base: int, symbols: dict[str, int]) -> AuditResult:
                     f"节 #{i} 数据区间 [{offset_hex(sh_offset)}, +{sh_size}) 超出文件边界",
                 )
         sections.append(sec)
+
+    if raw_shstrndx == SHN_XINDEX:
+        # 扩展节名字符串表索引：真实值在第 0 节头的 sh_link
+        e_shstrndx = sections[0]["link"]
+        if e_shstrndx >= e_shnum:
+            raise AuditViolation(
+                "section",
+                "bad_shstrndx",
+                f"扩展 e_shstrndx（第 0 节 sh_link={e_shstrndx}）超出节表范围",
+            )
 
     shstr = sections[e_shstrndx]
     if shstr["type"] != SHT_STRTAB:
@@ -419,15 +438,66 @@ def _audit(data: bytes, load_base: int, symbols: dict[str, int]) -> AuditResult:
         )
     strtab = sections[symtab["link"]]
     strtab_blob = data[strtab["offset"] : strtab["offset"] + strtab["size"]]
-    xindex_table = next(
-        (
-            sec
-            for sec in sections
-            if sec["type"] == SHT_SYMTAB_SHNDX and sec["link"] == symtab["index"]
-        ),
-        None,
-    )
-    xindex_entry_count = 0 if xindex_table is None else xindex_table["size"] // 4
+
+    # --- SHT_SYMTAB_SHNDX（扩展节索引节） ---------------------------------
+    # st_shndx==SHN_XINDEX(0xFFFF) 的符号在此取得真实节编号；每个符号一项
+    # Elf32_Word（小端 4 字节），节必须与符号表关联（sh_link 指向 symtab）。
+    xindex_sections = [s for s in sections if s["type"] == SHT_SYMTAB_SHNDX]
+    xindex_values: list[int] | None = None
+    if xindex_sections:
+        if len(xindex_sections) > 1:
+            raise AuditViolation(
+                "section",
+                "symtab_shndx_not_unique",
+                f"必须至多存在一个 SHT_SYMTAB_SHNDX，实际找到 {len(xindex_sections)} 个",
+            )
+        xindex_table = xindex_sections[0]
+        if xindex_table["link"] != symtab["index"]:
+            raise AuditViolation(
+                "section",
+                "bad_symtab_shndx_link",
+                f"SHT_SYMTAB_SHNDX 节 {xindex_table['name'] or '#' + str(xindex_table['index'])} "
+                f"的 sh_link={xindex_table['link']} 未指向唯一 SHT_SYMTAB(#{symtab['index']})",
+            )
+        if xindex_table["entsize"] not in (0, 4):
+            raise AuditViolation(
+                "section",
+                "bad_symtab_shndx_entsize",
+                f"SHT_SYMTAB_SHNDX 节表项尺寸必须为 4，实际 {xindex_table['entsize']}",
+            )
+        if xindex_table["size"] % 4 != 0:
+            raise AuditViolation(
+                "section",
+                "bad_symtab_shndx_size",
+                f"SHT_SYMTAB_SHNDX 节字节数 {xindex_table['size']} 不是 4 的整数倍（长度不匹配）",
+            )
+        xindex_entry_count = xindex_table["size"] // 4
+        if xindex_entry_count != sym_count:
+            raise AuditViolation(
+                "section",
+                "bad_symtab_shndx_length",
+                f"SHT_SYMTAB_SHNDX 表项数 {xindex_entry_count} 与符号表表项数 {sym_count} 不一致",
+            )
+        xoff = xindex_table["offset"]
+        xindex_values = [
+            _unpack("<I", data, xoff + k * 4, f"SHT_SYMTAB_SHNDX[{k}]")[0]
+            for k in range(xindex_entry_count)
+        ]
+        # 扩展表项是真实节编号，因此 >= SHN_LORESERVE 的值在此完全合法
+        # （扩展编号正是为这些节而存在）：取值须落在节表范围内，或为保留
+        # 转义值 SHN_ABS/SHN_COMMON；SHN_XINDEX 不可递归出现。
+        for k, xval in enumerate(xindex_values):
+            if xval < len(sections):
+                continue
+            if xval in (SHN_ABS, SHN_COMMON):
+                continue
+            raise AuditViolation(
+                "section",
+                "bad_extended_symbol_index",
+                f"SHT_SYMTAB_SHNDX[{k}]=0x{xval:04x} 既非合法节编号（共 {len(sections)} 节）"
+                "也非受支持的保留节索引",
+                detail={"index_entry": k, "value": xval},
+            )
 
     def parse_symbol(sym_idx: int, *, owner_entry: int | None = None) -> dict[str, Any]:
         if sym_idx == 0 or sym_idx >= sym_count:
@@ -442,14 +512,14 @@ def _audit(data: bytes, load_base: int, symbols: dict[str, int]) -> AuditResult:
             _SYM_FMT, data, soff, f"符号 #{sym_idx}"
         )
         if st_shndx == SHN_XINDEX:
-            if xindex_table is None or sym_idx >= xindex_entry_count:
+            if xindex_values is None or sym_idx >= len(xindex_values):
                 raise AuditViolation(
                     "entry",
                     "bad_extended_symbol_index",
-                    f"符号 #{sym_idx} 缺少可用的扩展节索引",
+                    f"符号 #{sym_idx} 的 st_shndx=SHN_XINDEX，但缺少关联的 SHT_SYMTAB_SHNDX 扩展索引",
                     entry_index=owner_entry,
                 )
-            st_shndx = text["index"]
+            st_shndx = xindex_values[sym_idx]
         name = _read_cstr(strtab_blob, st_name)
         if name is None:
             raise AuditViolation(
@@ -573,19 +643,30 @@ def _audit(data: bytes, load_base: int, symbols: dict[str, int]) -> AuditResult:
                     **loc,
                 )
             s_addr = (load_base + sym["value"]) & UINT64_MAX
-        elif shndx >= SHN_LORESERVE or shndx >= len(sections):
+        elif shndx < len(sections):
+            # 真实存在但不是唯一 .text 的节：普通编号与扩展高编号一视同仁，
+            # 均按“定义在非代码节”定位拒绝。
+            raise AuditViolation(
+                "entry",
+                "symbol_not_in_text",
+                f"符号 {sym['name']!r} 定义在非 .text 节 "
+                f"{sections[shndx]['name'] or '#' + str(shndx)}（节编号 {shndx}），"
+                "无法由单一装载基址推导地址",
+                **loc,
+            )
+        elif SHN_LORESERVE <= shndx <= SHN_HIRESERVE:
             raise AuditViolation(
                 "entry",
                 "unsupported_symbol_section",
-                f"符号 {sym['name']!r} 的 st_shndx={shndx} 为不受支持的特殊节索引",
+                f"符号 {sym['name']!r} 的 st_shndx=0x{shndx:04x} 为保留特殊节索引"
+                "（如 SHN_ABS/SHN_COMMON），无法由单一装载基址推导地址",
                 **loc,
             )
         else:
             raise AuditViolation(
                 "entry",
-                "symbol_not_in_text",
-                f"符号 {sym['name']!r} 定义在非 .text 节 "
-                f"{sections[shndx]['name'] or '#' + str(shndx)}，无法由单一装载基址推导地址",
+                "bad_symbol_section",
+                f"符号 {sym['name']!r} 的 st_shndx={shndx} 超出节表范围（共 {len(sections)} 节）",
                 **loc,
             )
 

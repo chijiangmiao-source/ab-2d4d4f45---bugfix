@@ -9,13 +9,15 @@
 文件必须同时满足：
 
 1. ELF64（`EI_CLASS=2`）、小端（`EI_DATA=1`）、`ET_REL`、`EM_X86_64`，无程序头；
-2. 节表/节名字符串表合法，存在**唯一** `.text`（`SHT_PROGBITS`）；
-3. 存在唯一 `SHT_SYMTAB` 及其 `SHT_STRTAB`，表项尺寸/`sh_info` 合法；
+2. 节表/节名字符串表合法，存在**唯一** `.text`（`SHT_PROGBITS`）；支持扩展节编号——节数 ≥ `0xFF00` 时使用 ELF 头扩展 `e_shnum`（第 0 节头 `sh_size`）与扩展 `e_shstrndx`（`SHN_XINDEX`，第 0 节头 `sh_link`）；
+3. 存在唯一 `SHT_SYMTAB` 及其 `SHT_STRTAB`，表项尺寸/`sh_info` 合法；符号 `st_shndx=SHN_XINDEX` 时必须由与该符号表关联（`sh_link` 指向它）的唯一 `SHT_SYMTAB_SHNDX` 节给出真实节编号（每符号一项 4 字节，项数与符号表一致）；
 4. 所有重定位节必须是指向该 `.text` 的 **SHT_RELA**（拒绝 `SHT_REL`、拒绝指向其他节）；
 5. 仅处理 `R_X86_64_64`（写 8 字节）与 `R_X86_64_PC32`（写 4 字节有符号）；
-6. 逐项校验：符号索引与字符串表、加数、写入范围不得越出 `.text` 节边界；
+6. 逐项校验：符号索引与字符串表、加数、写入范围不得越出 `.text` 节边界；**任何**符号（含经 `SHT_SYMTAB_SHNDX` 取得高编号节的符号）若定义在唯一 `.text` 之外的真实节（普通编号或扩展高编号一视同仁），即稳定定位该非代码节并整体拒绝；
 7. 所有补丁区间两两不得重叠；
 8. `R_X86_64_PC32` 的 `S + A − P` 经 64 位补码回绕后必须落在有符号 32 位范围 `[-2^31, 2^31−1]`，越界即整体拒绝。
+
+扩展节编号的边界：高编号 `.text` 定义符号仍按基址规则计算；高编号文件中的 `SHN_UNDEF` 外部符号继续使用审查员提交的准确地址；`SHT_SYMTAB_SHNDX` 缺失（符号声明 `SHN_XINDEX` 却无表）、数据被截断、`sh_size` 非 4 整数倍或与符号表项数不一致、`sh_link` 关联错误、`sh_entsize` 非法、表项再次为 `SHN_XINDEX` 或指向不存在的节，都会给出可定位拒绝，且不产生任何部分补丁。
 
 计算（AMD64 psABI）：
 
@@ -51,7 +53,7 @@
 ```bash
 python3 -m app.server                      # 默认 0.0.0.0:8080
 HOST=127.0.0.1 PORT=9090 python3 -m app.server
-python3 -m unittest discover -s tests -v   # 47 项测试
+python3 -m unittest discover -s tests -v   # 63 项测试
 ```
 
 ## 容器运行（宿主端口可配置）
@@ -65,12 +67,15 @@ HOST_PORT=9090 docker compose up --build   # 自定义宿主端口
 
 `verify` 服务在同一次运行中依次核对：
 
-1. **测试**：`python3 -m unittest discover` 全量（47 项）；
+1. **测试**：`python3 -m unittest discover` 全量（63 项）；
 2. **构建**：全部源码字节编译 + 关键模块导入 + 页面存在；
 3. **HTTP 冒烟**：健康检查、页面、
    - 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
    - 重叠写入拒绝（`patch_overlap`，定位 `entry_index=1`，旧成功结论被清除）；
-   - PC32 有符号 32 位溢出拒绝（`pc32_overflow`），无部分结果。
+   - PC32 有符号 32 位溢出拒绝（`pc32_overflow`），无部分结果；
+   - 扩展节编号（节数 ≥ `0xFF00`）文件中高编号 `.text` 符号与外部符号成功计算 S/A/P、写入字节与冻结摘要；
+   - 高编号非代码节（`.rodata`）定义符号整体拒绝（`symbol_not_in_text`，稳定定位违约项），同一标识下旧成功结论被清除，无任何部分补丁；
+   - 扩展索引元数据异常（长度不匹配、关联错误、索引节缺失）可定位拒绝，无部分结果。
 
 ```bash
 # 以 verify 的退出码作为整条命令退出码
@@ -91,8 +96,9 @@ BASE_URL=http://127.0.0.1:8080 python3 scripts/verify.py
 app/elfaudit.py        ELF 解析 / 校验 / 重定位计算 / 冻结结论核心
 app/server.py          页面、审计 API、健康检查
 app/static/index.html  审计页面
-tests/elfbuild.py      内存构造 ELF64 ET_REL 的测试夹具
+tests/elfbuild.py      内存构造 ELF64 ET_REL 的测试夹具（含扩展节编号构造器）
 tests/test_audit.py    47 项单元/集成/HTTP 测试
+tests/test_xindex.py   16 项扩展节编号（SHT_SYMTAB_SHNDX）专项测试
 scripts/verify.py      Compose verify 验收脚本
 Dockerfile / docker-compose.yml
 ```

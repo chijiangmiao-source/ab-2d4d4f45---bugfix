@@ -8,7 +8,9 @@ SHT_PROGBITS = 1
 SHT_SYMTAB = 2
 SHT_STRTAB = 3
 SHT_RELA = 4
+SHT_NOBITS = 8
 SHT_REL = 9
+SHT_SYMTAB_SHNDX = 18
 
 ET_REL = 1
 EM_X86_64 = 62
@@ -19,6 +21,9 @@ R_X86_64_PC32 = 2
 STB_GLOBAL = 1
 STT_NOTYPE = 0
 STT_SECTION = 3
+
+SHN_LORESERVE = 0xFF00
+SHN_XINDEX = 0xFFFF
 
 
 def _align(pos: int, align: int) -> int:
@@ -171,13 +176,13 @@ def build_elf(
         ehdr = struct.pack(
             ">16sHHIQQQIHHHHHH",
             bytes(ei_ident), e_type, e_machine, 1, 0, e_phoff, shoff, 0, 64, 0, 0, 64, len(logical),
-            shstr_idx if shstrndx_valid else 0xFFFF,
+            shstr_idx if shstrndx_valid else 0xFFFE,
         )
     else:
         ehdr = struct.pack(
             "<16sHHIQQQIHHHHHH",
             bytes(ei_ident), e_type, e_machine, 1, 0, e_phoff, shoff, 0, 64, 0, 0, 64, len(logical),
-            shstr_idx if shstrndx_valid else 0xFFFF,
+            shstr_idx if shstrndx_valid else 0xFFFE,
         )
     out[0:64] = ehdr
 
@@ -202,5 +207,187 @@ def build_elf(
             sec.get("entsize", 0),
         )
         out[shoff + i * 64 : shoff + (i + 1) * 64] = shdr
+
+    return bytes(out)
+
+
+def build_xindex_elf(
+    *,
+    text: bytes = b"\x00" * 32,
+    rodata: bytes = b"RODATA!\x00",
+    symbols: list[tuple[str, str, int]] | None = None,
+    relocs: list[dict] | None = None,
+    pad_count: int = 0xFF00 - 2,
+    include_xindex: bool = True,
+    xindex_link: int | None = None,
+    xindex_entsize: int | None = None,
+    xindex_size_mode: str = "ok",
+    xindex_eof_truncated: bool = False,
+    xindex_values: dict[int, int] | None = None,
+    bad_extended_shstrndx: bool = False,
+) -> bytes:
+    """构造节数进入扩展编号范围（>= 0xFF00）的 ET_REL。
+
+    逻辑布局（P = pad_count）：
+
+        0=null；1..P=.p 占位 SHT_PROGBITS（零长，共享节名）；
+        P+1=.rodata（非代码高编号节）；P+2=.text；P+3=.strtab；
+        P+4=.symtab；P+5=.symtab_shndx；P+6=.rela.text；P+7=.shstrtab。
+
+    symbols 每项 ``(名称, 目标, st_value)``，目标取值：
+
+    * ``"undef"``：SHN_UNDEF 外部符号；
+    * ``"text"``：st_shndx=SHN_XINDEX，扩展索引指向高编号 .text；
+    * ``"rodata"``：st_shndx=SHN_XINDEX，扩展索引指向高编号非代码节。
+
+    默认 P=0xFF00-2，使 .text 恰为节 #0xFF00、总节数 0xFF06，因此
+    e_shnum 与 e_shstrndx 都必须使用扩展形式（0 / SHN_XINDEX）。
+
+    扩展索引元数据可通过参数构造各类异常：``include_xindex=False`` 缺失、
+    ``xindex_size_mode`` 为 short/extra/odd（长度不匹配/非 4 整数倍）、
+    ``xindex_eof_truncated`` 数据区间越出文件、``xindex_link`` 关联错误、
+    ``xindex_entsize`` 表项尺寸错误、``xindex_values`` 覆写单个表项取值。
+    """
+    symbols = symbols or []
+    relocs = relocs or []
+
+    n_pad = pad_count
+    idx_rodata = n_pad + 1
+    idx_text = n_pad + 2
+    idx_strtab = n_pad + 3
+    idx_symtab = n_pad + 4
+    idx_xindex = n_pad + 5
+    idx_rela = n_pad + 6
+    idx_shstr = n_pad + 7
+    nsec = n_pad + 8
+
+    # ---- 数据布局（节头之前） ----
+    pos = 64
+    text_off = pos
+    pos += len(text)
+    rodata_off = pos
+    pos += len(rodata)
+
+    strtab_blob = b"\x00"
+    str_offsets: list[int] = []
+    for name, _target, _value in symbols:
+        str_offsets.append(len(strtab_blob))
+        strtab_blob += name.encode("latin-1") + b"\x00"
+    strtab_off = pos
+    pos += len(strtab_blob)
+
+    sym_count = len(symbols) + 1
+    symtab_blob = b"\x00" * 24
+    for i, (_name, target, value) in enumerate(symbols):
+        shndx = 0 if target == "undef" else SHN_XINDEX
+        info = (STB_GLOBAL << 4) | STT_NOTYPE
+        symtab_blob += struct.pack("<IBBHQQ", str_offsets[i], info, 0, shndx, value, 0)
+    symtab_off = pos
+    pos += len(symtab_blob)
+
+    # 扩展索引表：与符号表一一对应
+    xvalues: dict[int, int] = {0: 0}
+    for i, (_name, target, _value) in enumerate(symbols, start=1):
+        xvalues[i] = {"undef": 0, "text": idx_text, "rodata": idx_rodata}[target]
+    if xindex_values:
+        xvalues.update(xindex_values)
+    xindex_words = b"".join(struct.pack("<I", xvalues[k]) for k in range(sym_count))
+    # extra 模式额外追加一个字，保证缩短/增长时数据区仍在文件内
+    xindex_blob = xindex_words + struct.pack("<I", 0)
+    xindex_off = pos
+    pos += len(xindex_blob)
+
+    rela_blob = b""
+    for r in relocs:
+        r_info = (r["sym"] << 32) | (r["type"] & 0xFFFFFFFF)
+        rela_blob += struct.pack("<QQq", r["offset"], r_info, r.get("addend", 0))
+    rela_off = pos
+    pos += len(rela_blob)
+
+    shstr_blob = (
+        b"\x00.p\x00.rodata\x00.text\x00.strtab\x00.symtab\x00"
+        b".symtab_shndx\x00.rela.text\x00.shstrtab\x00"
+    )
+    name_pad = 1
+    name_rodata = 4
+    name_text = 12
+    name_strtab = 18
+    name_symtab = 26
+    name_xindex = 34
+    name_rela = 48
+    name_shstr = 59
+    shstr_off = pos
+    pos += len(shstr_blob)
+
+    shoff = (pos + 7) & ~7
+    total = shoff + nsec * 64
+    out = bytearray(total)
+
+    # ---- ELF 头（扩展 e_shnum / e_shstrndx） ----
+    ehdr_shnum = 0 if nsec >= SHN_LORESERVE else nsec
+    ehdr_shstr = SHN_XINDEX if nsec >= SHN_LORESERVE else idx_shstr
+    ei = bytearray(16)
+    ei[0:4] = b"\x7fELF"
+    ei[4], ei[5], ei[6] = 2, 1, 1
+    out[0:64] = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        bytes(ei), ET_REL, EM_X86_64, 1, 0, 0, shoff, 0, 64, 0, 0, 64,
+        ehdr_shnum, ehdr_shstr,
+    )
+
+    # ---- 各节数据 ----
+    out[text_off : text_off + len(text)] = text
+    out[rodata_off : rodata_off + len(rodata)] = rodata
+    out[strtab_off : strtab_off + len(strtab_blob)] = strtab_blob
+    out[symtab_off : symtab_off + len(symtab_blob)] = symtab_blob
+    out[xindex_off : xindex_off + len(xindex_blob)] = xindex_blob
+    out[rela_off : rela_off + len(rela_blob)] = rela_blob
+    out[shstr_off : shstr_off + len(shstr_blob)] = shstr_blob
+
+    # ---- 第 0 节头：sh_size=真实节数；sh_link=真实 shstrndx ----
+    sec0_link = nsec if bad_extended_shstrndx else idx_shstr
+    struct.pack_into(
+        "<IIQQQQIIQQ", out, shoff,
+        0, 0, 0, 0, 0, nsec, sec0_link, 0, 0, 0,
+    )
+
+    def put_header(i: int, sh_name: int, sh_type: int, sh_offset: int, sh_size: int,
+                   link: int = 0, info: int = 0, entsize: int = 0) -> None:
+        struct.pack_into(
+            "<IIQQQQIIQQ", out, shoff + i * 64,
+            sh_name, sh_type, 0, 0, sh_offset, sh_size, link, info, 1, entsize,
+        )
+
+    # 占位节：零长 SHT_PROGBITS，共享同一节名
+    pad_hdr = struct.pack("<IIQQQQIIQQ", name_pad, SHT_PROGBITS, 0, 0, 64, 0, 0, 0, 1, 0)
+    for i in range(1, n_pad + 1):
+        out[shoff + i * 64 : shoff + (i + 1) * 64] = pad_hdr
+
+    put_header(idx_rodata, name_rodata, SHT_PROGBITS, rodata_off, len(rodata))
+    put_header(idx_text, name_text, SHT_PROGBITS, text_off, len(text))
+    put_header(idx_strtab, name_strtab, SHT_STRTAB, strtab_off, len(strtab_blob))
+    put_header(idx_symtab, name_symtab, SHT_SYMTAB, symtab_off, len(symtab_blob),
+               link=idx_strtab, info=1, entsize=24)
+
+    xindex_size = {
+        "ok": sym_count * 4,
+        "short": (sym_count - 1) * 4,
+        "extra": (sym_count + 1) * 4,
+        "odd": sym_count * 4 + 2,
+    }[xindex_size_mode]
+    if include_xindex:
+        x_off = total if xindex_eof_truncated else xindex_off
+        put_header(
+            idx_xindex, name_xindex, SHT_SYMTAB_SHNDX, x_off, xindex_size,
+            link=idx_symtab if xindex_link is None else xindex_link,
+            entsize=4 if xindex_entsize is None else xindex_entsize,
+        )
+    else:
+        # 保留槽位但换成其他类型，模拟扩展索引节缺失（节编号不位移）
+        put_header(idx_xindex, name_xindex, SHT_PROGBITS, xindex_off, 0)
+
+    put_header(idx_rela, name_rela, SHT_RELA, rela_off, len(rela_blob),
+               link=idx_symtab, info=idx_text, entsize=24)
+    put_header(idx_shstr, name_shstr, SHT_STRTAB, shstr_off, len(shstr_blob))
 
     return bytes(out)

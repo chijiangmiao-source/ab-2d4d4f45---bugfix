@@ -4,10 +4,15 @@
 
 1. 单元测试（``python -m unittest`` 全量）；
 2. 构建检查（全部源码字节编译 + 关键模块导入）；
-3. HTTP 冒烟（健康检查 + 三个必测场景）：
+3. HTTP 冒烟（健康检查 + 六个必测场景）：
    a. 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
    b. 重叠写入被拒绝（patch_overlap）；
-   c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果。
+   c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果；
+   d. 扩展节编号（>=0xFF00，SHT_SYMTAB_SHNDX）文件中高编号 .text 符号
+      与外部符号成功计算 S/A/P、写入字节与冻结摘要；
+   e. 高编号非代码节定义符号被整体拒绝（symbol_not_in_text，可定位），
+      同一稳定标识下旧成功结论被清除，且无任何部分补丁；
+   f. 扩展索引元数据异常（长度不匹配/缺失）被可定位拒绝，无部分结果。
 
 任何一步失败立即以非零退出码结束；全部成功退出码为 0。
 """
@@ -30,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from elfbuild import build_elf  # noqa: E402
+from elfbuild import build_elf, build_xindex_elf  # noqa: E402
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8080")
 TIMEOUT = 5
@@ -58,7 +63,12 @@ def check_unit_tests() -> None:
 
 def check_build() -> None:
     step("2/3 构建检查（字节编译 + 模块导入）")
-    for py in list((ROOT / "app").rglob("*.py")) + [Path(__file__)]:
+    sources = (
+        list((ROOT / "app").rglob("*.py"))
+        + list((ROOT / "tests").rglob("*.py"))
+        + [Path(__file__)]
+    )
+    for py in sources:
         try:
             py_compile.compile(str(py), doraise=True)
         except py_compile.PyCompileError as exc:
@@ -160,6 +170,43 @@ def pc32_overflow_elf() -> bytes:
     )
 
 
+# --- 扩展节编号（节数 >= 0xFF00）样本 -------------------------------------
+
+XBASE = 0x400000
+XSYMS = {"ext_foo": 0x500000, "memcpy": 0x400200}
+
+
+def xindex_good_elf() -> bytes:
+    """高编号 .text(#0xFF00) 符号 + 外部符号，双类型重定位。"""
+    return build_xindex_elf(
+        text=bytes(range(48)),
+        symbols=[
+            ("ext_foo", "undef", 0),
+            ("memcpy", "undef", 0),
+            ("local_fn", "text", 0x10),
+        ],
+        relocs=[
+            {"offset": 0x00, "sym": 1, "type": 1, "addend": 0x10},
+            {"offset": 0x08, "sym": 2, "type": 2, "addend": -4},
+            {"offset": 0x10, "sym": 3, "type": 2, "addend": 0},
+        ],
+    )
+
+
+def xindex_noncode_elf() -> bytes:
+    """第 1 项引用的本地符号定义在高编号非代码节 .rodata。"""
+    return build_xindex_elf(
+        symbols=[
+            ("ext_foo", "undef", 0),
+            ("data_obj", "rodata", 0),
+        ],
+        relocs=[
+            {"offset": 0x00, "sym": 1, "type": 1, "addend": 0x10},
+            {"offset": 0x08, "sym": 2, "type": 1, "addend": 0},
+        ],
+    )
+
+
 def check_http_smoke() -> None:
     step("3/3 HTTP 冒烟")
     wait_for_health()
@@ -249,6 +296,106 @@ def check_http_smoke() -> None:
     if status != 200 or stored.get("ok"):
         fail("溢出记录不应包含成功结论/部分补丁")
     print("verify: PC32 有符号 32 位溢出已拒绝，未生成部分结果")
+
+    # 场景 d：扩展节编号文件 —— 高编号 .text 符号与外部符号成功
+    payload = {
+        "audit_id": "verify-xindex-good",
+        "file_base64": b64(xindex_good_elf()),
+        "load_base": hex(XBASE),
+        "symbols": XSYMS,
+    }
+    status, body = http_post("/api/audit", payload)
+    if status != 200 or not body.get("ok"):
+        fail(f"扩展编号高编号 .text 重定位应成功：HTTP {status} {body}")
+    if len(body.get("items", [])) != 3:
+        fail(f"应返回 3 个重定位项，实际 {len(body.get('items', []))}")
+    by_off = {it["offset"]: it for it in body["items"]}
+    r64 = by_off[0]
+    # 外部符号逐字采用用户地址
+    if r64["symbol"] != "ext_foo" or r64["S"] != "0x0000000000500000":
+        fail(f"外部符号地址错误：{r64}")
+    if r64["after_hex"] != struct.pack("<Q", 0x500010).hex():
+        fail(f"R_X86_64_64 写入值错误：{r64['after_hex']}")
+    local = by_off[0x10]
+    # 高编号 .text(#0xFF00) 定义符号：S = base + st_value，差值为 0
+    if local["symbol"] != "local_fn" or local["S"] != "0x0000000000400010":
+        fail(f"高编号 .text 符号 S 计算错误：{local}")
+    if local["P"] != "0x0000000000400010" or local["value"] != "0x00000000":
+        fail(f"高编号 .text 符号 P/value 计算错误：{local}")
+    if local["after_hex"] != struct.pack("<i", 0).hex():
+        fail(f"高编号 .text 符号写入字节错误：{local['after_hex']}")
+    for key in ("S", "A", "P", "value", "before_hex", "after_hex"):
+        if key not in local:
+            fail(f"成功结果缺少字段 {key}")
+    if len(body.get("patched_sha256", "")) != 64 or len(body.get("conclusion", "")) != 64:
+        fail("补丁摘要 / 冻结结论缺失")
+    x_conclusion = body["conclusion"]
+    status, fetched = http_get("/api/result/verify-xindex-good")
+    if status != 200 or not fetched.get("ok") or fetched.get("conclusion") != x_conclusion:
+        fail("扩展编号冻结结论无法按标识读回或不一致")
+    print(f"verify: 扩展编号高 .text 重定位成功，结论 {x_conclusion}")
+
+    # 场景 e：高编号非代码节符号整体拒绝，清除同一标识旧成功结论，无部分补丁
+    payload = {
+        "audit_id": "verify-xindex-good",  # 故意复用：旧 PASS 必须被清除
+        "file_base64": b64(xindex_noncode_elf()),
+        "load_base": hex(XBASE),
+        "symbols": {"ext_foo": 0x500000},
+    }
+    status, body = http_post("/api/audit", payload)
+    if status != 200 or body.get("ok"):
+        fail(f"高编号非代码节符号应被拒绝：HTTP {status} {body}")
+    v = body.get("violation", {})
+    if v.get("code") != "symbol_not_in_text":
+        fail(f"违约代码应为 symbol_not_in_text：{v}")
+    if v.get("entry_index") != 1 or v.get("rela_index") != 1:
+        fail(f"未稳定定位到非代码节违约项：{v}")
+    if v.get("symbol") != "data_obj" or ".rodata" not in v.get("message", ""):
+        fail(f"违约定位未指向高编号非代码节：{v}")
+    for leaked in ("conclusion", "patches", "items", "patched_text_hex"):
+        if leaked in body:
+            fail(f"拒绝响应泄露部分结果字段 {leaked}")
+    status, again = http_get("/api/result/verify-xindex-good")
+    if status != 200 or again.get("ok") or "conclusion" in again:
+        fail("同一标识下旧成功结论未被清除或仍可读到部分补丁")
+    print("verify: 高编号非代码节符号已拒绝（symbol_not_in_text, entry_index=1），旧结论已清除")
+
+    # 场景 f：扩展索引元数据异常（长度不匹配 / 关联错误 / 缺失）拒绝，无部分结果
+    meta_cases = [
+        ("short", "长度短于符号表", dict(xindex_size_mode="short"), "bad_symtab_shndx_length"),
+        ("badlink", "关联错误", dict(xindex_link=3), "bad_symtab_shndx_link"),
+        ("missing", "节缺失", dict(include_xindex=False), "bad_extended_symbol_index"),
+    ]
+    for case_id, label, kwargs, expect_code in meta_cases:
+        bad = build_xindex_elf(
+            text=bytes(range(48)),
+            symbols=[
+                ("ext_foo", "undef", 0),
+                ("memcpy", "undef", 0),
+                ("local_fn", "text", 0x10),
+            ],
+            relocs=[
+                {"offset": 0x00, "sym": 1, "type": 1, "addend": 0x10},
+                {"offset": 0x08, "sym": 2, "type": 2, "addend": -4},
+                {"offset": 0x10, "sym": 3, "type": 2, "addend": 0},
+            ],
+            **kwargs,
+        )
+        payload = {
+            "audit_id": f"verify-xindex-meta-{case_id}",
+            "file_base64": b64(bad),
+            "load_base": hex(XBASE),
+            "symbols": XSYMS,
+        }
+        status, body = http_post("/api/audit", payload)
+        if status != 200 or body.get("ok"):
+            fail(f"扩展索引{label}应被拒绝：HTTP {status} {body}")
+        if body["violation"].get("code") != expect_code:
+            fail(f"扩展索引{label}违约代码应为 {expect_code}：{body['violation']}")
+        for leaked in ("conclusion", "patches", "items", "patched_text_hex"):
+            if leaked in body:
+                fail(f"扩展索引{label}拒绝响应泄露部分结果字段 {leaked}")
+        print(f"verify: 扩展索引{label}已拒绝（{expect_code}），无部分结果")
 
 
 def main() -> None:
